@@ -848,3 +848,255 @@ func TestIssue58(t *testing.T) {
 		t.Fatalf("expected error, got none and read:\n%x\n%s\n%v", buf, buf, buf)
 	}
 }
+
+// testBitWriter packs bits LSB-first, the way brotli streams are laid out.
+type testBitWriter struct {
+	buf  []byte
+	nbit uint
+}
+
+func (w *testBitWriter) writeBits(n uint, v uint32) {
+	for i := uint(0); i < n; i++ {
+		for uint(len(w.buf)) <= w.nbit>>3 {
+			w.buf = append(w.buf, 0)
+		}
+		if v>>i&1 != 0 {
+			w.buf[w.nbit>>3] |= 1 << (w.nbit & 7)
+		}
+		w.nbit++
+	}
+}
+
+// writeZeroBits skips n bits, leaving them zero. It must only be followed by
+// more zero bits.
+func (w *testBitWriter) writeZeroBits(n uint) {
+	w.nbit += n
+}
+
+// writeSingleSymbolCode writes a simple prefix code with a single symbol;
+// decoding that symbol consumes no bits at all.
+func (w *testBitWriter) writeSingleSymbolCode(alphabetBits uint, symbol uint32) {
+	w.writeBits(2, 1) // HSKIP = 1: simple prefix code
+	w.writeBits(2, 0) // NSYM - 1 = 0
+	w.writeBits(alphabetBits, symbol)
+}
+
+// bytes returns the stream padded to a byte boundary with zero bits, followed
+// by trailing zero bytes.
+func (w *testBitWriter) bytes(trailing int) []byte {
+	out := make([]byte, int((w.nbit+7)/8)+trailing)
+	copy(out, w.buf)
+	return out
+}
+
+const (
+	// A category that declares a single block type keeps the initial block
+	// length of a meta-block, 1<<24, see decoderStateMetablockBegin.
+	invalidSwitchBlockLength = 1 << 24
+
+	// Insert-and-copy symbol 130: no literals, copy length 4, explicit
+	// distance.
+	invalidSwitchEmptyCommand = 130
+
+	// With NPOSTFIX = 3 and NDIRECT = 120, distance symbol 304 is followed by
+	// 11 (zero) extra bits and decodes to distance 49241. At output position 0
+	// that is a static dictionary reference to a 4-byte word with transform 48
+	// (OmitLast7), which produces no output. Such commands never complete the
+	// meta-block, so a stream can hold as many of them as it likes.
+	invalidSwitchEmptyDistance  = 304
+	invalidSwitchDistanceExtras = 11
+)
+
+// writeInvalidSwitchMetablockStart writes the stream header and the start of
+// a last meta-block with MLEN = 1.
+func writeInvalidSwitchMetablockStart(w *testBitWriter) {
+	w.writeBits(1, 0)  // WBITS = 16
+	w.writeBits(1, 1)  // ISLAST
+	w.writeBits(1, 0)  // ISLASTEMPTY = 0
+	w.writeBits(2, 0)  // MNIBBLES = 4
+	w.writeBits(16, 0) // MLEN - 1 = 0
+}
+
+// writeInvalidSwitchPrefixCodes writes the rest of the meta-block header after
+// the block type declarations: distance parameters, a single literal and
+// distance tree, and one single-symbol insert-and-copy code per command block
+// type.
+func writeInvalidSwitchPrefixCodes(w *testBitWriter, commandSymbols ...uint32) {
+	w.writeBits(2, 3)  // NPOSTFIX = 3
+	w.writeBits(4, 15) // NDIRECT = 15 << NPOSTFIX = 120
+	w.writeBits(2, 0)  // context mode of the only literal block type
+	w.writeBits(1, 0)  // NTREESL = 1
+	w.writeBits(1, 0)  // NTREESD = 1
+	w.writeSingleSymbolCode(8, 'A')
+	for _, symbol := range commandSymbols {
+		w.writeSingleSymbolCode(10, symbol)
+	}
+	w.writeSingleSymbolCode(10, invalidSwitchEmptyDistance)
+}
+
+// invalidCommandSwitchStream returns a stream whose only meta-block declares
+// a single block type for every category, followed by exactly 1<<24 commands
+// that produce no output, so decoding the next command needs a command block
+// switch that the header never allowed. trailing zero bytes are appended.
+// It also returns the offset of the byte holding the end of the last command.
+func invalidCommandSwitchStream(trailing int) ([]byte, int) {
+	w := &testBitWriter{}
+	writeInvalidSwitchMetablockStart(w)
+	w.writeBits(1, 0) // NBLTYPESL = 1
+	w.writeBits(1, 0) // NBLTYPESI = 1
+	w.writeBits(1, 0) // NBLTYPESD = 1
+	writeInvalidSwitchPrefixCodes(w, invalidSwitchEmptyCommand)
+	w.writeZeroBits(invalidSwitchBlockLength * invalidSwitchDistanceExtras)
+	return w.bytes(trailing), int(w.nbit / 8)
+}
+
+// invalidDistanceSwitchStream returns a stream whose only meta-block declares
+// two command block types but a single distance block type. The first command
+// block is longer than 1<<24 commands, so the distance block length runs out
+// while a command still needs a distance: an invalid distance block switch.
+// Past that point the stream is well-formed: more commands that produce no
+// output, a valid switch to the second command block type, and a command that
+// inserts the literal 'A' and completes the meta-block. A decoder that ignores
+// the invalid distance block switch accepts the stream and outputs "A".
+// It also returns the offset of the byte where the invalid switch is reached.
+func invalidDistanceSwitchStream() ([]byte, int) {
+	const extraCommands = 256
+	w := &testBitWriter{}
+	writeInvalidSwitchMetablockStart(w)
+	w.writeBits(1, 0) // NBLTYPESL = 1
+	w.writeBits(1, 1) // NBLTYPESI = 2
+	w.writeBits(3, 0)
+	w.writeSingleSymbolCode(2, 1)  // block type code 1: previous type + 1
+	w.writeSingleSymbolCode(5, 25) // block length code 25: 16625 + 24 bits
+	w.writeBits(24, invalidSwitchBlockLength+extraCommands-16625)
+	w.writeBits(1, 0) // NBLTYPESD = 1
+	// Command block type 1 uses symbol 8: insert 1 literal, copy length 2,
+	// implicit distance.
+	writeInvalidSwitchPrefixCodes(w, invalidSwitchEmptyCommand, 8)
+	w.writeZeroBits(invalidSwitchBlockLength * invalidSwitchDistanceExtras)
+	critical := int(w.nbit / 8)
+	w.writeZeroBits(extraCommands * invalidSwitchDistanceExtras)
+	w.writeZeroBits(24) // command block switch: block length 16625
+	// The last command and its literal consume no bits.
+	return w.bytes(0), critical
+}
+
+// chunkedReader serves data in reads that end at offsets chosen by next. It
+// lets a test decide whether the decoder reaches a point of the stream on its
+// fast path (plenty of buffered input) or on its byte-wise safe path.
+type chunkedReader struct {
+	data []byte
+	pos  int
+	next func(pos int) int
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	end := r.next(r.pos)
+	if end > len(r.data) {
+		end = len(r.data)
+	}
+	if end-r.pos > len(p) {
+		end = r.pos + len(p)
+	}
+	n := copy(p, r.data[r.pos:end])
+	r.pos += n
+	return n, nil
+}
+
+// splitBefore returns a chunkedReader that ends one read at offset split and
+// then serves the rest of data in reads of at most chunk bytes.
+func splitBefore(data []byte, split, chunk int) *chunkedReader {
+	return &chunkedReader{data: data, next: func(pos int) int {
+		if pos < split {
+			return split
+		}
+		return pos + chunk
+	}}
+}
+
+// decodeWithDeadline decodes everything from src. A decoder that panics or
+// never terminates fails the test instead of crashing or hanging it.
+func decodeWithDeadline(t *testing.T, src io.Reader) ([]byte, error) {
+	t.Helper()
+	type result struct {
+		out      []byte
+		err      error
+		panicked interface{}
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				done <- result{panicked: p}
+			}
+		}()
+		out, err := io.ReadAll(NewReader(src))
+		done <- result{out: out, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.panicked != nil {
+			t.Fatalf("decoder panicked: %v", r.panicked)
+		}
+		return r.out, r.err
+	case <-time.After(2 * time.Minute):
+		t.Fatalf("decoder did not terminate")
+	}
+	return nil, nil
+}
+
+// TestDecodeInvalidBlockSwitch checks that a block switch in a category that
+// declares a single block type is reported as a format error. A meta-block
+// reaches such a switch once it has used up the initial block length of
+// 1<<24 (e.g. with commands that produce no output). The decoder used to
+// ignore it, which made it spin forever on its fast path, overflow its
+// internal input buffer on its safe path, and accept malformed streams.
+func TestDecodeInvalidBlockSwitch(t *testing.T) {
+	wantErr := decodeError(decoderErrorFormatBlockSwitch)
+	if got := wantErr.Error(); got != "brotli: BLOCK_SWITCH" {
+		t.Errorf("error message = %q, want %q", got, "brotli: BLOCK_SWITCH")
+	}
+
+	const trailing = 64
+	stream, critical := invalidCommandSwitchStream(trailing)
+
+	t.Run("CommandFastPath", func(t *testing.T) {
+		// The invalid switch is reached with plenty of input buffered.
+		src := splitBefore(stream, critical-4096, readBufSize)
+		out, err := decodeWithDeadline(t, src)
+		if err != wantErr || len(out) != 0 {
+			t.Errorf("decode = %q, %v; want no output, %v", out, err, wantErr)
+		}
+	})
+
+	t.Run("CommandSafePath", func(t *testing.T) {
+		// The input arrives one byte at a time around the invalid switch.
+		src := splitBefore(stream, critical-trailing, 1)
+		out, err := decodeWithDeadline(t, src)
+		if err != wantErr || len(out) != 0 {
+			t.Errorf("decode = %q, %v; want no output, %v", out, err, wantErr)
+		}
+	})
+
+	t.Run("CommandEndOfInput", func(t *testing.T) {
+		// The stream ends right before the invalid switch: this is a
+		// format error, not a truncated stream.
+		src := bytes.NewReader(stream[:len(stream)-trailing])
+		out, err := decodeWithDeadline(t, src)
+		if err != wantErr || len(out) != 0 {
+			t.Errorf("decode = %q, %v; want no output, %v", out, err, wantErr)
+		}
+	})
+
+	t.Run("Distance", func(t *testing.T) {
+		stream, critical := invalidDistanceSwitchStream()
+		src := splitBefore(stream, critical-4096, readBufSize)
+		out, err := decodeWithDeadline(t, src)
+		if err != wantErr || len(out) != 0 {
+			t.Errorf("decode = %q, %v; want no output, %v", out, err, wantErr)
+		}
+	})
+}
