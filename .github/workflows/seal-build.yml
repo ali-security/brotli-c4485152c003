@@ -1,0 +1,115 @@
+name: seal-build
+
+# Authored by the sealed-libraries builder: upstream github.com/andybalholm/brotli
+# ships no GitHub Actions CI. This workflow builds the Go module zip exactly as
+# proxy.golang.org serves it and runs the package's own `go test ./...` suite.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional Go test-name selector; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Build x/mod zip helper
+        shell: bash
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/helper"
+          cd "$RUNNER_TEMP/helper"
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              out, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer out.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(out, mv, os.Args[4]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/modzip" .
+      - name: Create module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/modsrc"
+          mkdir -p "$src"
+          tar --exclude=./.git -cf - . | tar -xf - -C "$src"
+          rm -f "$src/.github/workflows/seal-build.yml"
+          if [ -d "$src/.github/workflows" ] && [ -z "$(ls -A "$src/.github/workflows")" ]; then rmdir "$src/.github/workflows"; fi
+          if [ -d "$src/.github" ] && [ -z "$(ls -A "$src/.github")" ]; then rmdir "$src/.github"; fi
+          mkdir -p dist
+          "$RUNNER_TEMP/modzip" github.com/andybalholm/brotli v1.2.0 "$PWD/dist/v1.2.0.zip" "$src"
+          unzip -l dist/v1.2.0.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v1.2.0.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.22.x", "1.23.x"]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Download modules
+        run: go mod download
+      - name: Test
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          go version
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -count=1 -run "^(${TEST_FILTER})$" ./... 2>&1 | tee test.log
+          else
+            go test -v -count=1 ./... 2>&1 | tee test.log
+          fi
+          pass=$(awk '/^ *--- PASS/{n++} END{print n+0}' test.log)
+          fail=$(awk '/^ *--- FAIL/{n++} END{print n+0}' test.log)
+          skip=$(awk '/^ *--- SKIP/{n++} END{print n+0}' test.log)
+          echo "TEST SUMMARY (go ${{ matrix.go }}): passed=$pass failed=$fail skipped=$skip"
+          awk '/^ *--- SKIP/{p=3} p>0{print; p--}' test.log
+          if [ "$fail" -ne 0 ]; then exit 1; fi
